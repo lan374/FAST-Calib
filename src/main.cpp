@@ -8,6 +8,7 @@ which is included as part of this source code package.
 #include "qr_detect.hpp"
 #include "lidar_detect.hpp"
 #include "data_preprocess.hpp"
+#include <limits>
 
 int main(int argc, char **argv) 
 {
@@ -58,26 +59,76 @@ int main(int argc, char **argv)
     }
 
     // 对 QR 和 LiDAR 检测到的圆心进行排序
-    PointCloud<PointXYZ>::Ptr qr_centers(new PointCloud<PointXYZ>);
+    PointCloud<PointXYZ>::Ptr qr_centers_sorted(new PointCloud<PointXYZ>);
     PointCloud<PointXYZ>::Ptr lidar_centers(new PointCloud<PointXYZ>);
-    sortPatternCenters(qr_center_cloud, qr_centers, "camera");
+    sortPatternCenters(qr_center_cloud, qr_centers_sorted, "camera");
     sortPatternCenters(lidar_center_cloud, lidar_centers, "lidar");
 
-    // 保存中间结果：排序后的 LiDAR 圆心和 QR 圆心
+    // 相机滚转安装时极角排序会循环错位；穷举 4 种移位，取 RMSE 最小的配对
+    PointCloud<PointXYZ>::Ptr qr_centers(new PointCloud<PointXYZ>);
+    Eigen::Matrix4f transformation = Eigen::Matrix4f::Identity();
+    pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_lidar_centers(new pcl::PointCloud<pcl::PointXYZ>);
+    double rmse = -1.0;
+
+    if (qr_centers_sorted->size() == 4 && lidar_centers->size() == 4)
+    {
+      pcl::registration::TransformationEstimationSVD<pcl::PointXYZ, pcl::PointXYZ> svd;
+      int best_shift = 0;
+      double best_rmse = std::numeric_limits<double>::max();
+      Eigen::Matrix4f best_T = Eigen::Matrix4f::Identity();
+      PointCloud<PointXYZ>::Ptr best_qr(new PointCloud<PointXYZ>);
+
+      std::cout << BOLDYELLOW << "[Pairing] Trying 4 cyclic shifts of camera centers:" << RESET << std::endl;
+      for (int shift = 0; shift < 4; ++shift)
+      {
+        PointCloud<PointXYZ>::Ptr qr_shifted(new PointCloud<PointXYZ>);
+        qr_shifted->resize(4);
+        for (int i = 0; i < 4; ++i)
+          (*qr_shifted)[i] = (*qr_centers_sorted)[(i + shift) % 4];
+
+        Eigen::Matrix4f T;
+        svd.estimateRigidTransformation(*lidar_centers, *qr_shifted, T);
+
+        pcl::PointCloud<pcl::PointXYZ>::Ptr aligned(new pcl::PointCloud<pcl::PointXYZ>);
+        alignPointCloud(lidar_centers, aligned, T);
+        double r = computeRMSE(qr_shifted, aligned);
+
+        std::cout << BOLDYELLOW << "  shift=" << shift << " RMSE=" << BOLDRED
+                  << std::fixed << std::setprecision(4) << r << " m" << RESET << std::endl;
+
+        if (r >= 0.0 && r < best_rmse)
+        {
+          best_rmse = r;
+          best_shift = shift;
+          best_T = T;
+          *best_qr = *qr_shifted;
+        }
+      }
+
+      *qr_centers = *best_qr;
+      transformation = best_T;
+      rmse = best_rmse;
+      std::cout << BOLDGREEN << "[Pairing] Selected shift=" << best_shift
+                << " with RMSE=" << std::fixed << std::setprecision(4) << rmse
+                << " m" << RESET << std::endl;
+    }
+    else
+    {
+      *qr_centers = *qr_centers_sorted;
+      pcl::registration::TransformationEstimationSVD<pcl::PointXYZ, pcl::PointXYZ> svd;
+      svd.estimateRigidTransformation(*lidar_centers, *qr_centers, transformation);
+      alignPointCloud(lidar_centers, aligned_lidar_centers, transformation);
+      rmse = computeRMSE(qr_centers, aligned_lidar_centers);
+    }
+
+    // 保存修正配对后的圆心（供多场景联合标定使用）
     saveTargetHoleCenters(lidar_centers, qr_centers, params);
 
-    // 计算外参
-    Eigen::Matrix4f transformation;
-    pcl::registration::TransformationEstimationSVD<pcl::PointXYZ, pcl::PointXYZ> svd;
-    svd.estimateRigidTransformation(*lidar_centers, *qr_centers, transformation);
-
-    // 将 LiDAR 点云转换到 QR 码坐标系
-    pcl::PointCloud<pcl::PointXYZ>::Ptr aligned_lidar_centers(new pcl::PointCloud<pcl::PointXYZ>);
+    aligned_lidar_centers->clear();
     aligned_lidar_centers->reserve(lidar_centers->size());
     alignPointCloud(lidar_centers, aligned_lidar_centers, transformation);
-    
-    double rmse = computeRMSE(qr_centers, aligned_lidar_centers);
-    if (rmse > 0) 
+
+    if (rmse > 0)
     {
       std::cout << BOLDYELLOW << "[Result] RMSE: " << BOLDRED << std::fixed << std::setprecision(4)
       << rmse << " m" << RESET << std::endl;
